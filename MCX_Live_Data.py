@@ -1,17 +1,77 @@
 import sys
+import argparse
 import pandas as pd
+import numpy as np
 import datetime
 import requests
+from scipy.stats import norm
+from scipy.optimize import minimize
+import warnings
+import argparse
+
+warnings.filterwarnings("ignore")
 
 pd.set_option('display.max_columns', None)  # Display all columns
 pd.set_option('display.width', None)        # Disable line wrapping to allow a single line
 pd.set_option('display.max_colwidth', None) # Display full column content without truncation
 
-def get_data():
-    # url = "https://www.mcxindia.com/backpage.aspx/GetMarketWatch"
-    
-    import requests
 
+def black_scholes_price(S,K, T, r, sigma, option_type= "call"):
+    d1 = (np.log(S/K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
+    d2 = d1 - sigma * np.sqrt(T)
+
+    if option_type == 'call':
+        option_price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    elif option_type == "put":
+        option_price = K * np.exp(-r * T)  * norm.cdf(-d2) - S  * norm.cdf(-d1)
+    else : 
+        raise ValueError("Invalid option type. Use 'call' or 'put'")
+    
+    return option_price
+
+def calculate_greeks(row):
+    S = row['UnderlineValue_CE'] # FUTPx / underlying contact value
+    K = row['StrikePrice']
+    T = row['TTE']
+    r = 0
+    market_price_call = row['LTP_CE']
+    market_price_put = row['LTP_PE']
+    
+    objective_function_call  = (lambda sigma : (black_scholes_price(S,K, T, r, sigma, option_type= "call") - market_price_call) ** 2)
+    objective_function_put = (lambda sigma : (black_scholes_price(S,K, T, r, sigma, option_type= "put") - market_price_call) ** 2)
+
+    #intital guess for implide volatality
+    initial_guess_sigma = 0.2
+
+    result_call = minimize(objective_function_call, initial_guess_sigma, bounds=[(0,1)])
+    implied_volatility_call = result_call.x[0]
+
+    result_put = minimize(objective_function_put, initial_guess_sigma, bounds=[(0,1)])
+    implied_volatility_put = result_put.x[0]
+
+    #Calulate delta using the IV
+    d1_call = (np.log(S / K) + (r + 0.5 * implied_volatility_call**2) * T) / (implied_volatility_call * np.sqrt(T))
+    delta_call = norm.cdf(d1_call)
+
+    d1_put = (np.log(S / K) + (r + 0.5 * implied_volatility_put**2) * T) / (implied_volatility_put * np.sqrt(T))
+    delta_put = norm.cdf(d1_put) - 1
+
+     # Round the Delta values to 2 decimal places
+    delta_call = round(delta_call, 2)
+    delta_put = round(delta_put, 2)
+
+    return pd.Series(
+        {
+            'ImpliedVolatilityCall': implied_volatility_call,
+            'DeltaCall': delta_call,
+            'ImpliedVolatilityPut': implied_volatility_put,
+            'DeltaPut': delta_put
+        }
+    )
+
+
+
+def get_data():
     cookies = {
         'ASP.NET_SessionId': 'vdmqtncuh30zzqmt5ue1par1',
         'device-source': 'https://www.mcxindia.com/',
@@ -71,15 +131,33 @@ def Options(Symbol):
     Opt_df = df.loc[(df.InstrumentName == "OPTFUT")]
     Opt_df = df.loc[(df.Symbol == Symbol)]
     Opt_df = Opt_df.sort_values(by='ExpiryDate')
+    Opt_df = Opt_df.loc[(Opt_df.ExpiryDate == Opt_df['ExpiryDate'].unique()[0])]
     CE_data = Opt_df.loc[(Opt_df.OptionType == "CE")]
     PE_data = Opt_df.loc[(Opt_df.OptionType == "PE")]
     merged_df = pd.merge(CE_data, PE_data, on='StrikePrice', suffixes= ('_CE','_PE'))
-    #merged_df = merged_df[['Open', 'Low', 'Volume', 'OpenInterest','NotionalValue', 'PremiumValue', 'OptionType','StrikePrice']]
-    merged_df = merged_df[['Open_CE', 'Low_CE', 'Volume_CE', 'OpenInterest_CE', 
-                       'NotionalValue_CE', 'PremiumValue_CE', 'OptionType_CE', 'StrikePrice',
-                       'Open_PE', 'Low_PE', 'Volume_PE', 'OpenInterest_PE', 
-                       'NotionalValue_PE', 'PremiumValue_PE', 'OptionType_PE']]
+    #Filter current exp data only
+    #merged_df = merged_df.loc[(merged_df.ExpiryDate_CE == merged_df['ExpiryDate_CE'].unique()[0])]
 
+    #calculate time to expiry for product
+    end_of_lasttrade_day = merged_df['ExpiryDate_CE'].unique()[0].replace(hour = 23, minute = 59, second=59, microsecond=999999)
+    time_to_expiry = (pd.to_datetime(end_of_lasttrade_day, format="%d%b%y", errors="coerce")).tz_localize("Asia/Kolkata") - pd.Timestamp.now(tz="Asia/Kolkata")
+
+    merged_df['TTE'] = (time_to_expiry.days + time_to_expiry.seconds/(60*60*24)) / 265
+
+    #calculate greeks
+    merged_df[['ImpliedVolatilityCall','DeltaCall','ImpliedVolatilityPut','DeltaPut']] = merged_df.apply(calculate_greeks, axis =1)
+
+    # ['__type_CE', 'Symbol_CE', 'ProductCode_CE', 'ExpiryDate_CE', 'Unit_CE','Open_CE', 'Low_CE', 'LTP_CE', 'High_CE', 'PreviousClose_CE',
+    # 'AbsoluteChange_CE', 'PercentChange_CE', 'Volume_CE', 'LTT_CE','BuyQuantity_CE', 'SellQuantity_CE', 'OpenInterest_CE','ValueInLacs_CE', 'BuyPrice_CE', 'SellPrice_CE', 'InstrumentName_CE',
+    # 'StrikePrice', 'OptionType_CE', 'PremiumValue_CE', 'NotionalValue_CE','UnderlineValue_CE', 'UnderlineContract_CE', '__type_PE', 'Symbol_PE','ProductCode_PE', 'ExpiryDate_PE', 'Unit_PE', 'Open_PE', 'Low_PE',
+    # 'LTP_PE', 'High_PE', 'PreviousClose_PE', 'AbsoluteChange_PE','PercentChange_PE', 'Volume_PE', 'LTT_PE', 'BuyQuantity_PE','SellQuantity_PE', 'OpenInterest_PE', 'ValueInLacs_PE', 'BuyPrice_PE',
+    # 'SellPrice_PE', 'InstrumentName_PE', 'OptionType_PE', 'PremiumValue_PE','NotionalValue_PE', 'UnderlineValue_PE', 'UnderlineContract_PE', 'TTE','ImpliedVolatilityCall', 'DeltaCall', 'ImpliedVolatilityPut','DeltaPut']
+    merged_df = merged_df[['ImpliedVolatilityCall', 'DeltaCall','Open_CE', 'Low_CE', 'Volume_CE', 'OpenInterest_CE', 
+                       'NotionalValue_CE', 'PremiumValue_CE', 'StrikePrice',
+                       'Open_PE', 'Low_PE', 'Volume_PE', 'OpenInterest_PE', 
+                       'NotionalValue_PE', 'PremiumValue_PE','DeltaPut','ImpliedVolatilityPut']]
+
+    merged_df = merged_df.sort_values(by='StrikePrice')
     return merged_df
 
 def MCX_Live_Data(segment, symbol):
@@ -91,12 +169,14 @@ def MCX_Live_Data(segment, symbol):
         print("Invalid Segment")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser( description= "Get Live data for MCX Futures and Options with greeks", formatter_class= argparse.ArgumentDefaultsHelpFormatter,)
+    parser.add_argument('segment', choices=['FUT', 'OPT'], help='Which derivative?')
+    parser.add_argument('symbol', nargs='?', help='Please provide ticker in uppercase')
     if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Usage: python MCX_Live_Data.py <segment> [<symbol>]")
-        print("<segment> should be either 'FUT' or 'OPT'.")
-        print("<symbol> is required if segment is 'OPT'.")
     else:
         segment = sys.argv[1]  # Get the segment from command line argument
         symbol = sys.argv[2] if len(sys.argv) == 3 else None  # Get the symbol if provided
+        args = parser.parse_args()
         MCX_Live_Data(segment, symbol)
 
